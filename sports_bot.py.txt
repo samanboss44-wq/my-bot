@@ -1,0 +1,318 @@
+import time
+import telebot
+from telebot import types
+import requests
+import urllib.parse
+import re
+import json
+from google import genai
+from mtranslate import translate
+
+# ----------------- تنظیمات ربات -----------------
+BOT_TOKEN = '8420289176:AAENOVQPMub_1HJ1Ti6QO-etq_Os87Xe_U4'
+GEMINI_API_KEY = 'AIzaSyAJUm5BhlVgSXx-WGW0ArgB70sqhhq1dNE'
+
+bot = telebot.TeleBot(BOT_TOKEN)
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+user_sessions = {}
+ITEMS_PER_PAGE = 10
+
+# 🧠 دیکشنری هوشمند اصطلاحات عامیانه ورزشی به زبان تخصصی پزشکی (PubMed)
+SPORTS_DICTIONARY = {
+    "چربی سوزی": "fat loss OR adipose tissue reduction OR lipolysis",
+    "لاغری": "weight loss OR obesity management",
+    "چاقی": "obesity OR weight gain",
+    "عضله سازی": "muscle hypertrophy OR muscle mass gain OR resistance training",
+    "حجم": "muscle hypertrophy",
+    "کات": "body composition OR fat loss",
+    "مکمل": "dietary supplements OR ergogenic aids",
+    "کراتین": "creatine supplementation",
+    "پروتئین": "protein supplementation OR dietary protein",
+    "برنامه ورزشی": "exercise prescription OR training volume OR resistance exercise",
+    "بدنسازی": "resistance training OR bodybuilding OR strength training",
+    "هوازی": "aerobic exercise OR cardio OR endurance training",
+    "اینتروال": "high-intensity interval training OR HIIT",
+    "تغذیه": "sports nutrition OR dietary intake",
+    "جلو بازو": "biceps brachii OR elbow flexors",
+    "پشت بازو": "triceps brachii",
+    "پا": "quadriceps OR lower limb musculature",
+    "سینه": "pectoralis major",
+    "زانو درد": "knee pain OR patellofemoles pain syndrome",
+    "کمر درد": "low back pain OR lumbar spine"
+}
+
+def is_persian(text):
+    return bool(re.search(r'[\u0600-\u06FF]', text))
+
+def ask_gemini(prompt_text):
+    try:
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt_text,
+        )
+        return response.text.strip()
+    except Exception as e:
+        print(f"🔴 Gemini API Error: {e}")
+        return None
+
+def google_translate_fallback(text, target_lang='fa'):
+    try:
+        return translate(text, target_lang)
+    except Exception as e:
+        print(f"🔴 Google Translate Error: {e}")
+        return text
+
+def optimize_search_query(user_query):
+    cleaned_query = user_query.lower().strip()
+    
+    # استفاده از تک‌کوتیشن در ابتدا و انتها برای آزاد بودن دبل‌کوتیشن‌های داخل متن
+    base_sports_filter = '(exercise OR "resistance training" OR bodybuilding OR "strength training" OR athletes)'
+    
+    matched_terms = []
+    
+    # نقشه‌برداری اصطلاحات عامیانه به ترم‌های دقیق پاب‌مد
+    mapping = {
+        "جلو بازو": '"biceps brachii" OR "elbow flexors"',
+        "پشت بازو": '"triceps brachii"',
+        "سینه": '"pectoralis major" OR "chest exercise"',
+        "پا": '"quadriceps" OR "lower limb" OR "squat"',
+        "زیربغل": '"latissimus dorsi" OR "back muscles"',
+        "شانه": '"deltoid" OR "shoulder exercise"',
+        "حجم": '"muscle hypertrophy" OR "muscle mass"',
+        "عضله سازی": '"muscle hypertrophy" OR "hypertrophy"',
+        "کات": '"body composition" OR "fat loss"',
+        "چربی سوزی": '"fat loss" OR "lipolysis" OR "adipose"',
+        "لاغری": '"weight loss"',
+        "مکمل": '"dietary supplements" OR "ergogenic aids"',
+        "کراتین": '"creatine supplementation"',
+        "پروتئین": '"protein supplementation" OR "whey protein"',
+        "برنامه": '"training volume" OR "exercise prescription"',
+        "هوازی": '"aerobic exercise" OR "cardio"',
+        "اینتروال": '"high-intensity interval training" OR "HIIT"'
+    }
+    
+    for farsi_word, english_mesh in mapping.items():
+        if farsi_word in cleaned_query:
+            matched_terms.append(english_mesh)
+            
+    if matched_terms:
+        final_query = f"({ ' AND '.join(matched_terms) }) AND {base_sports_filter}"
+        return final_query
+    
+    if is_persian(user_query):
+        translated = google_translate_fallback(user_query, 'en')
+        return f"({translated}) AND {base_sports_filter}"
+    
+    return f"({user_query}) AND {base_sports_filter}"
+
+def batch_translate_titles(titles_list):
+    if not titles_list:
+        return []
+    
+    prompt = (
+        "Translate these academic sports titles into concise, natural Persian titles (max 7-8 words) for Telegram buttons.\n"
+        "Return ONLY a valid JSON list of strings. No markdown.\n"
+        f"Titles:\n{json.dumps(titles_list)}"
+    )
+    
+    raw_response = ask_gemini(prompt)
+    
+    if not raw_response:
+        return [google_translate_fallback(t, "fa")[:50] + "..." for t in titles_list]
+    
+    try:
+        cleaned = raw_response.strip()
+        backtick = chr(96) * 3
+        cleaned = cleaned.replace(backtick + "json", "")
+        cleaned = cleaned.replace(backtick, "")
+        cleaned = cleaned.strip()
+        
+        persian_titles = json.loads(cleaned)
+        if isinstance(persian_titles, list) and len(persian_titles) == len(titles_list):
+            return persian_titles
+    except Exception as e:
+        print(f"Parsing Error: {e}")
+    
+    return [google_translate_fallback(t, "fa")[:50] + "..." for t in titles_list]
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    welcome_text = (
+        "⚡️ **به موتور جستجوی هوشمند و تخصصی مقالات ورزشی خوش آمدید!**\n\n"
+        "🔎 موضوع مورد نظر خود را بفرستید (مثال: چربی سوزی اینتروال، مکمل کراتین، هایپرتروفی سینه)"
+    )
+    bot.reply_to(message, welcome_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: True)
+def handle_search(message):
+    user_query = message.text.strip()
+    chat_id = message.chat.id
+    
+    bot.send_message(chat_id, f"🔄 در حال بهینه‌سازی کلمات کلیدی برای جستجوی علمی...")
+    
+    search_query = optimize_search_query(user_query)
+    search_query = search_query.replace("[", "").replace("]", "")
+    
+    loading_msg = bot.send_message(chat_id, f"🔍 در حال سرچ تخصصی در پایگاه PubMed برای:\n`{search_query}`", parse_mode='Markdown')
+
+    try:
+        safe_query = urllib.parse.quote_plus(search_query)
+        search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={safe_query}&retmode=json&retmax=40&sort=relevance"
+        
+        response = requests.get(search_url, timeout=15).json()
+        id_list = response.get('esearchresult', {}).get('idlist', [])
+        
+        if not id_list:
+            simplified_query = google_translate_fallback(user_query, 'en')
+            safe_query = urllib.parse.quote_plus(simplified_query)
+            search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={safe_query}&retmode=json&retmax=30&sort=relevance"
+            response = requests.get(search_url, timeout=15).json()
+            id_list = response.get('esearchresult', {}).get('idlist', [])
+            
+            if not id_list:
+                bot.edit_message_text("❌ متأسفانه مقاله علمی دقیقی پیدا نشد. کلمات کلیدی خود را تغییر دهید (مثلاً: کراتین بدنسازی).", chat_id, loading_msg.message_id)
+                return
+            
+        ids_string = ",".join(id_list)
+        summary_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id={ids_string}&retmode=json"
+        summary_response = requests.get(summary_url, timeout=15).json()
+        results = summary_response.get('result', {})
+        
+        articles = []
+        for uid in id_list:
+            if uid in results and 'title' in results[uid]:
+                title = results[uid].get('title')
+                pubdate = results[uid].get('pubdate', 'تاریخ نامشخص')
+                source = results[uid].get('source', 'Journal Unknown') 
+                link = f"https://pubmed.ncbi.nlm.nih.gov/{uid}/"
+                articles.append({'title': title, 'pubdate': pubdate, 'link': link, 'uid': uid, 'source': source})
+        
+        user_sessions[chat_id] = {
+            'articles': articles,
+            'current_page': 0,
+            'query': user_query
+        }
+        
+        bot.delete_message(chat_id, loading_msg.message_id)
+        send_page_menu(chat_id)
+        
+    except Exception as e:
+        print(f"🔴 Connection Error: {e}")
+        bot.send_message(chat_id, f"😢 مشکلی در ارتباط با سرور دیتابیس رخ داد. لطفاً دوباره تلاش کنید.")
+
+def send_page_menu(chat_id):
+    session = user_sessions.get(chat_id)
+    if not session: return
+        
+    articles = session['articles']
+    page = session['current_page']
+    
+    start_index = page * ITEMS_PER_PAGE
+    end_index = start_index + ITEMS_PER_PAGE
+    page_items = articles[start_index:end_index]
+    
+    total_pages = (len(articles) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+    
+    status_msg = bot.send_message(chat_id, f"⚡️ در حال ترجمه و آماده‌سازی عناوین صفحه {page + 1}...")
+
+    english_titles = [item['title'] for item in page_items]
+    persian_titles = batch_translate_titles(english_titles)
+
+    markup = types.InlineKeyboardMarkup()
+    
+    for i, entry in enumerate(page_items):
+        global_index = start_index + i
+        title_fa = persian_titles[i] if i < len(persian_titles) else entry['title'][:40] + "..."
+            
+        btn_text = f"📄 [{global_index + 1}] {title_fa}"
+        button = types.InlineKeyboardButton(text=btn_text, callback_data=f"showart_{global_index}")
+        markup.add(button)
+        
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(types.InlineKeyboardButton(text="⬅️ قبلی", callback_data="prev_page"))
+    if end_index < len(articles):
+        nav_buttons.append(types.InlineKeyboardButton(text="بعدی ➡️", callback_data="next_page"))
+        
+    if nav_buttons:
+        markup.row(*nav_buttons)
+        
+    menu_text = f"📚 **نتایج یافت شده برای:** `{session['query']}`\n📌 **صفحه:** {page + 1} از {total_pages}\n\n🔥 مرتبط‌ترین مقالات بر اساس رنکینگ PubMed:"
+    
+    bot.delete_message(chat_id, status_msg.message_id)
+    bot.send_message(chat_id, menu_text, reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    chat_id = call.message.chat.id
+    data = call.data
+    session = user_sessions.get(chat_id)
+    
+    if not session:
+        bot.answer_callback_query(call.id, "نشست شما منقضی شده است.")
+        return
+
+    if data == "next_page":
+        session['current_page'] += 1
+        bot.delete_message(chat_id, call.message.message_id)
+        send_page_menu(chat_id)
+        
+    elif data == "prev_page":
+        session['current_page'] -= 1
+        bot.delete_message(chat_id, call.message.message_id)
+        send_page_menu(chat_id)
+        
+    elif data.startswith("showart_"):
+        article_index = int(data.split("_")[1])
+        wait_msg = bot.send_message(chat_id, "🧠 در حال استخراج تخصصی اطلاعات مقاله...")
+        
+        try:
+            selected_art = session['articles'][article_index]
+            uid = selected_art['uid']
+            
+            fetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={uid}&retmode=xml"
+            fetch_response = requests.get(fetch_url, timeout=15)
+            
+            abstract_text = ""
+            import xml.etree.ElementTree as ET
+            try:
+                root = ET.fromstring(fetch_response.content)
+                abstract_nodes = root.findall('.//AbstractText')
+                if abstract_nodes:
+                    abstract_text = " ".join([node.text for node in abstract_nodes if node.text])
+            except:
+                abstract_text = "خلاصه متن اصلی در دسترس نیست."
+
+            prompt_post = (
+                f"You are an expert sports scientist. Translate and transform this study into an elite, attractive Persian Telegram post.\n"
+                f"Include:\n- Catchy Persian Title\n- Original English Title\n- Publishing Journal\n- Practical application (کاربرد عملی) for coaches/athletes in bullet points.\n\n"
+                f"Title: {selected_art['title']}\nSource: {selected_art['source']}\nAbstract: {abstract_text}"
+            )
+            
+            final_post = ask_gemini(prompt_post)
+            bot.delete_message(chat_id, wait_msg.message_id)
+            
+            if final_post:
+                final_post += f"\n\n📅 **تاریخ انتشار:** {selected_art['pubdate']}\n🔗 [لینک مرجع]({selected_art['link']})"
+                bot.send_message(chat_id, final_post, parse_mode='Markdown')
+            else:
+                translated_title = google_translate_fallback(selected_art['title'], 'fa')
+                translated_abstract = google_translate_fallback(abstract_text, 'fa')
+                
+                fallback_post = (
+                    f"📢 **{translated_title}**\n\n"
+                    f"📘 **عنوان اصلی:** {selected_art['title']}\n"
+                    f"🔬 **ژورنال علمی:** {selected_art['source']}\n"
+                    f"📅 **تاریخ:** {selected_art['pubdate']}\n\n"
+                    f"📝 **خلاصه مقاله (ترجمه هوشمند):**\n{translated_abstract}\n\n"
+                    f"🔗 [مشاهده مقاله در پاب‌مد]({selected_art['link']})"
+                )
+                bot.send_message(chat_id, fallback_post, parse_mode='Markdown')
+                
+        except Exception as e:
+            print(f"Post Error: {e}")
+            bot.send_message(chat_id, "❌ مشکلی در نمایش اطلاعات این مقاله رخ داد.")
+
+print("🚀 ربات با موتور بهینه‌ساز کلمات کلیدی (مقاوم در برابر جمینای) روشن شد!")
+bot.infinity_polling()
